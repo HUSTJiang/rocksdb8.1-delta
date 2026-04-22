@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <deque>
+#include <map>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -17,6 +18,7 @@
 #include "db/pinned_iterators_manager.h"
 #include "db/range_del_aggregator.h"
 #include "db/snapshot_checker.h"
+#include "delta/hotspot_manager.h"
 #include "options/cf_options.h"
 #include "rocksdb/compaction_filter.h"
 
@@ -55,6 +57,7 @@ class SequenceIterWrapper : public InternalIterator {
   }
   Slice key() const override { return inner_iter_->key(); }
   Slice value() const override { return inner_iter_->value(); }
+  uint64_t GetPhysicalId() override { return inner_iter_->GetPhysicalId(); }
 
   // Unused InternalIterator methods
   void SeekToFirst() override { assert(false); }
@@ -205,7 +208,8 @@ class CompactionIterator {
       const std::shared_ptr<Logger> info_log = nullptr,
       const std::string* full_history_ts_low = nullptr,
       const SequenceNumber preserve_time_min_seqno = kMaxSequenceNumber,
-      const SequenceNumber preclude_last_level_min_seqno = kMaxSequenceNumber);
+      const SequenceNumber preclude_last_level_min_seqno = kMaxSequenceNumber,
+      std::shared_ptr<HotspotManager> hotspot_manager = nullptr);
 
   // Constructor with custom CompactionProxy, used for tests.
   CompactionIterator(
@@ -224,7 +228,8 @@ class CompactionIterator {
       const std::shared_ptr<Logger> info_log = nullptr,
       const std::string* full_history_ts_low = nullptr,
       const SequenceNumber preserve_time_min_seqno = kMaxSequenceNumber,
-      const SequenceNumber preclude_last_level_min_seqno = kMaxSequenceNumber);
+      const SequenceNumber preclude_last_level_min_seqno = kMaxSequenceNumber,
+      std::shared_ptr<HotspotManager> hotspot_manager = nullptr);
 
   ~CompactionIterator();
 
@@ -254,6 +259,7 @@ class CompactionIterator {
   }
   const CompactionIterationStats& iter_stats() const { return iter_stats_; }
   uint64_t num_input_entry_scanned() const { return input_.num_itered(); }
+  uint64_t input_file_number() { return input_.GetPhysicalId(); }
   // If the current key should be placed on penultimate level, only valid if
   // per_key_placement is supported
   bool output_to_penultimate_level() const {
@@ -262,10 +268,22 @@ class CompactionIterator {
   Status InputStatus() const { return input_.status(); }
 
   bool IsDeleteRangeSentinelKey() const { return is_range_del_; }
+  void SetInvolvedCuids(std::unordered_set<uint64_t>* cuids) {
+    involved_cuids_ = cuids;
+  }
+  void SetInputMap(std::map<uint64_t, std::unordered_set<uint64_t>>* input_map) {
+    input_map_ = input_map;
+  }
+  uint64_t ConsumeSkipGap() {
+    uint64_t gap = cuid_gap_after_skip_;
+    cuid_gap_after_skip_ = 0;
+    return gap;
+  }
 
  private:
   // Processes the input stream to find the next output
   void NextFromInput();
+  void CheckHotspotFilters();
 
   // Do final preparations before presenting the output to the callee.
   void PrepareOutput();
@@ -509,6 +527,14 @@ class CompactionIterator {
   // Stores whether the current compaction iterator output
   // is a range tombstone start key.
   bool is_range_del_{false};
+
+  std::shared_ptr<HotspotManager> hotspot_manager_;
+  uint64_t current_cuid_ = 0;
+  uint64_t current_file_number_ = 0;
+  bool skip_current_cuid_ = false;
+  std::unordered_set<uint64_t>* involved_cuids_ = nullptr;
+  std::map<uint64_t, std::unordered_set<uint64_t>>* input_map_ = nullptr;
+  uint64_t cuid_gap_after_skip_ = 0;
 };
 
 inline bool CompactionIterator::DefinitelyInSnapshot(SequenceNumber seq,

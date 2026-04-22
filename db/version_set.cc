@@ -1052,6 +1052,13 @@ class LevelIterator final : public InternalIterator {
 
   bool IsDeleteRangeSentinelKey() const override { return to_return_sentinel_; }
 
+  uint64_t GetPhysicalId() override {
+    if (flevel_ != nullptr && file_index_ < flevel_->num_files) {
+      return flevel_->files[file_index_].file_metadata->fd.GetNumber();
+    }
+    return 0;
+  }
+
  private:
   // Return true if at least one invalid file is seen and skipped.
   bool SkipEmptyFileForward();

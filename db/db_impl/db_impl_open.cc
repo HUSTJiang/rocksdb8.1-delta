@@ -1831,6 +1831,10 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
   s = impl->Recover(column_families, false, false, false, &recovered_seq,
                     &recovery_ctx);
   if (s.ok()) {
+    if (impl->immutable_db_options_.enable_delta) {
+      Options hotspot_opts(db_options, column_families[0].options);
+      impl->InitializeHotspotManager(hotspot_opts);
+    }
     uint64_t new_log_number = impl->versions_->NewFileNumber();
     log::Writer* new_log = nullptr;
     const size_t preallocate_block_size =

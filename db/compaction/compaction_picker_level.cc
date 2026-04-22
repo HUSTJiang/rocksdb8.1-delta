@@ -9,12 +9,14 @@
 
 #include "db/compaction/compaction_picker_level.h"
 
+#include <algorithm>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "db/version_edit.h"
 #include "logging/log_buffer.h"
+#include "logging/logging.h"
 #include "test_util/sync_point.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -62,6 +64,12 @@ class LevelCompactionBuilder {
         mutable_cf_options_(mutable_cf_options),
         ioptions_(ioptions),
         mutable_db_options_(mutable_db_options) {}
+
+  bool PickMixedL0Compaction();
+
+  void SetupInitialFilesDelta();
+
+  void AcceptStartLevelInputs() { compaction_inputs_.push_back(start_level_inputs_); }
 
   // Pick and return a compaction.
   Compaction* PickCompaction();
@@ -145,6 +153,78 @@ class LevelCompactionBuilder {
 
   static const int kMinFilesForIntraL0Compaction = 4;
 };
+
+void LevelCompactionBuilder::SetupInitialFilesDelta() {
+  if (!PickMixedL0Compaction()) {
+    start_level_inputs_.clear();
+  }
+}
+
+bool LevelCompactionBuilder::PickMixedL0Compaction() {
+  const int trigger_count =
+      mutable_cf_options_.delta_options.compaction_l0_trigger_count;
+  const uint64_t trigger_age_sec =
+      mutable_cf_options_.delta_options.compaction_l0_trigger_age_sec;
+  const size_t files_to_pick =
+      mutable_cf_options_.delta_options.compaction_l0_files_to_pick;
+
+  const std::vector<FileMetaData*>& l0_files = vstorage_->LevelFiles(0);
+  const size_t total_files = l0_files.size();
+  if (total_files < 2) {
+    return false;
+  }
+
+  bool trigger_by_count =
+      total_files >= static_cast<size_t>(trigger_count);
+  bool trigger_by_time = false;
+
+  FileMetaData* oldest_file = l0_files.back();
+  uint64_t creation_time = oldest_file->file_creation_time;
+  uint64_t now_sec = ioptions_.env->NowMicros() / 1000000;
+  if (creation_time > 0 && creation_time != kUnknownFileCreationTime) {
+    trigger_by_time = now_sec > creation_time + trigger_age_sec;
+  } else if (trigger_age_sec == 0) {
+    trigger_by_time = true;
+  }
+
+  if (!trigger_by_count && !trigger_by_time) {
+    return false;
+  }
+
+  size_t current_pick_count = 0;
+  start_level_inputs_.files.clear();
+  for (int i = static_cast<int>(total_files) - 1; i >= 0; --i) {
+    if (l0_files[i]->being_compacted) {
+      if (current_pick_count > 0) {
+        current_pick_count = 0;
+        start_level_inputs_.files.clear();
+      }
+      continue;
+    }
+
+    start_level_inputs_.files.push_back(l0_files[i]);
+    ++current_pick_count;
+    if (current_pick_count == files_to_pick) {
+      break;
+    }
+  }
+
+  if (current_pick_count == 0) {
+    return false;
+  }
+  if (!trigger_by_time && current_pick_count < files_to_pick) {
+    start_level_inputs_.files.clear();
+    return false;
+  }
+
+  std::reverse(start_level_inputs_.files.begin(),
+               start_level_inputs_.files.end());
+  start_level_ = 0;
+  output_level_ = 0;
+  start_level_inputs_.level = 0;
+  compaction_reason_ = CompactionReason::kLevelL0FilesNum;
+  return true;
+}
 
 void LevelCompactionBuilder::PickFileToCompact(
     const autovector<std::pair<int, FileMetaData*>>& level_files,
@@ -472,6 +552,19 @@ bool LevelCompactionBuilder::SetupOtherInputsIfNeeded() {
 }
 
 Compaction* LevelCompactionBuilder::PickCompaction() {
+  if (ioptions_.enable_delta) {
+    SetupInitialFilesDelta();
+    if (start_level_inputs_.empty()) {
+      return nullptr;
+    }
+
+    assert(start_level_ >= 0 && output_level_ >= 0);
+    AcceptStartLevelInputs();
+    Compaction* c = GetCompaction();
+    TEST_SYNC_POINT_CALLBACK("LevelCompactionPicker::PickCompaction:Return", c);
+    return c;
+  }
+
   // Pick up the first file to start compaction. It may have been extended
   // to a clean cut.
   SetupInitialFiles();
@@ -837,5 +930,33 @@ Compaction* LevelCompactionPicker::PickCompaction(
                                  mutable_cf_options, ioptions_,
                                  mutable_db_options);
   return builder.PickCompaction();
+}
+
+Compaction* LevelCompactionPicker::CompactRange(
+    const std::string& cf_name, const MutableCFOptions& mutable_cf_options,
+    const MutableDBOptions& mutable_db_options, VersionStorageInfo* vstorage,
+    int input_level, int output_level,
+    const CompactRangeOptions& compact_range_options, const InternalKey* begin,
+    const InternalKey* end, InternalKey** compaction_end,
+    bool* manual_conflict, uint64_t max_file_num_to_ignore,
+    const std::string& trim_ts) {
+  if (input_level == 0) {
+    LogBuffer log_buffer(INFO_LEVEL, ioptions_.info_log.get());
+    LevelCompactionBuilder builder(cf_name, vstorage, this, &log_buffer,
+                                   mutable_cf_options, ioptions_,
+                                   mutable_db_options);
+    if (builder.PickMixedL0Compaction()) {
+      builder.AcceptStartLevelInputs();
+      Compaction* c = builder.GetCompaction();
+      log_buffer.FlushBufferToLog();
+      *compaction_end = nullptr;
+      return c;
+    }
+  }
+
+  return CompactionPicker::CompactRange(
+      cf_name, mutable_cf_options, mutable_db_options, vstorage, input_level,
+      output_level, compact_range_options, begin, end, compaction_end,
+      manual_conflict, max_file_num_to_ignore, trim_ts);
 }
 }  // namespace ROCKSDB_NAMESPACE

@@ -99,6 +99,13 @@ LIB_SOURCES =                                                   \
   db/write_controller.cc                                        \
   db/write_stall_stats.cc                                       \
   db/write_thread.cc                                            \
+  delta/diag_log.cc                                             \
+  delta/global_delete_count_table.cc                            \
+  delta/hot_data_buffer.cc                                      \
+  delta/hot_index_table.cc                                      \
+  delta/hot_iterators.cc                                        \
+  delta/hotspot_manager.cc                                      \
+  delta/scan_frequency_table.cc                                 \
   env/composite_env.cc                                          \
   env/env.cc                                                    \
   env/env_chroot.cc                                             \
@@ -430,6 +437,7 @@ TEST_MAIN_SOURCES =                                                     \
   cache/cache_reservation_manager_test.cc                               \
   cache/lru_cache_test.cc                                               \
   cache/compressed_secondary_cache_test.cc                              \
+  test/rocksdb_delta_functional.cc                                      \
   db/blob/blob_counting_iterator_test.cc                                \
   db/blob/blob_file_addition_test.cc                                    \
   db/blob/blob_file_builder_test.cc                                     \

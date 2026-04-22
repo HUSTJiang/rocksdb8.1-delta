@@ -134,6 +134,13 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
            block_iter_points_to_real_block_;
   }
 
+  uint64_t GetPhysicalId() override {
+    if (table_ && table_->get_rep()) {
+      return table_->get_rep()->file_number;
+    }
+    return 0;
+  }
+
   void ResetDataIter() {
     if (block_iter_points_to_real_block_) {
       if (pinned_iters_mgr_ != nullptr && pinned_iters_mgr_->PinningEnabled()) {

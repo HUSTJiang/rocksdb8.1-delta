@@ -750,6 +750,13 @@ set(SOURCES
         db/write_controller.cc
         db/write_stall_stats.cc
         db/write_thread.cc
+        delta/diag_log.cc
+        delta/global_delete_count_table.cc
+        delta/hot_data_buffer.cc
+        delta/hot_index_table.cc
+        delta/hot_iterators.cc
+        delta/hotspot_manager.cc
+        delta/scan_frequency_table.cc
         env/composite_env.cc
         env/env.cc
         env/env_chroot.cc
@@ -1279,6 +1286,11 @@ option(WITH_ALL_TESTS "Build all test, rather than a small subset" ON)
 
 if(WITH_TESTS OR WITH_BENCHMARK_TOOLS)
   add_subdirectory(third-party/gtest-1.8.1/fused-src/gtest)
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # Keep global -Werror for project code, but avoid GCC false positives in
+    # vendored gtest 1.8.1 (gtest-all.cc StackGrowsDown).
+    target_compile_options(gtest PRIVATE -Wno-error=maybe-uninitialized)
+  endif()
   add_library(testharness STATIC
   test_util/mock_time_env.cc
   test_util/secondary_cache_test_util.cc
@@ -1625,3 +1637,10 @@ option(WITH_BENCHMARK "build benchmark tests" OFF)
 if(WITH_BENCHMARK)
   add_subdirectory(${PROJECT_SOURCE_DIR}/microbench/)
 endif()
+
+# for delta
+add_executable(rocksdb_scan test/rocksdb_scan.cc)
+target_link_libraries(rocksdb_scan rocksdb testharness gtest ${THIRDPARTY_LIBS} ${SYSTEM_LIBS})
+
+add_executable(rocksdb_delta_functional test/rocksdb_delta_functional.cc)
+target_link_libraries(rocksdb_delta_functional rocksdb testharness gtest ${THIRDPARTY_LIBS} ${SYSTEM_LIBS})

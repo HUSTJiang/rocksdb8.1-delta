@@ -104,6 +104,8 @@ struct ImmutableDBOptions {
   Logger* logger;
   std::shared_ptr<CompactionService> compaction_service;
   bool enforce_single_del_contracts;
+  bool enable_delta = true;
+  mutable std::shared_ptr<HotspotManager> hotspot_manager;
 
   bool IsWalDirSameAsDBPath() const;
   bool IsWalDirSameAsDBPath(const std::string& path) const;

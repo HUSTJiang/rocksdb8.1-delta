@@ -73,7 +73,9 @@ Status BuildTable(
     const std::string* full_history_ts_low,
     BlobFileCompletionCallback* blob_callback, Version* version,
     uint64_t* num_input_entries, uint64_t* memtable_payload_bytes,
-    uint64_t* memtable_garbage_bytes) {
+    uint64_t* memtable_garbage_bytes,
+    std::unordered_map<uint64_t, DataSegment>* output_segments,
+    HotspotManager* hotspot_manager) {
   assert((tboptions.column_family_id ==
           TablePropertiesCollectorFactory::Context::kUnknownColumnFamily) ==
          tboptions.column_family_name.empty());
@@ -217,6 +219,19 @@ Status BuildTable(
       if (!s.ok()) {
         break;
       }
+
+      if (hotspot_manager != nullptr && output_segments != nullptr) {
+        const uint64_t cuid = hotspot_manager->ExtractCUID(key);
+        if (cuid != 0) {
+          DataSegment& seg = (*output_segments)[cuid];
+          seg.file_number = meta->fd.GetNumber();
+          if (seg.first_key.empty()) {
+            seg.first_key = key.ToString();
+          }
+          seg.last_key = key.ToString();
+        }
+      }
+
       builder->Add(key, value);
 
       s = meta->UpdateBoundaries(key, value, ikey.sequence, ikey.type);

@@ -12,8 +12,12 @@
 #include <deque>
 #include <functional>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <set>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -31,6 +35,7 @@
 #include "db/version_edit.h"
 #include "db/write_controller.h"
 #include "db/write_thread.h"
+#include "delta/hotspot_manager.h"
 #include "logging/event_logger.h"
 #include "options/cf_options.h"
 #include "options/db_options.h"
@@ -146,6 +151,14 @@ class SubcompactionState;
 
 class CompactionJob {
  public:
+  struct DeltaOutputInfo {
+    uint64_t cuid = 0;
+    uint64_t file_number = 0;
+    std::string first_key;
+    std::string last_key;
+    uint64_t entry_count = 0;
+  };
+
   CompactionJob(
       int job_id, Compaction* compaction, const ImmutableDBOptions& db_options,
       const MutableDBOptions& mutable_db_options,
@@ -166,7 +179,8 @@ class CompactionJob {
       std::string full_history_ts_low = "", std::string trim_ts = "",
       BlobFileCompletionCallback* blob_callback = nullptr,
       int* bg_compaction_scheduled = nullptr,
-      int* bg_bottom_compaction_scheduled = nullptr);
+      int* bg_bottom_compaction_scheduled = nullptr,
+      std::shared_ptr<HotspotManager> hotspot_manager = nullptr);
 
   virtual ~CompactionJob();
 
@@ -346,6 +360,13 @@ class CompactionJob {
   // key has bigger (newer) sequence number than this, it will be precluded from
   // the last level (output to penultimate level).
   SequenceNumber preclude_last_level_min_seqno_ = kMaxSequenceNumber;
+
+  std::shared_ptr<HotspotManager> hotspot_manager_;
+  std::unordered_set<uint64_t> compaction_involved_cuids_;
+  std::map<uint64_t, std::unordered_set<uint64_t>> global_cuid_inputs_;
+  std::vector<DeltaOutputInfo> global_outputs_;
+  std::mutex delta_mutex_;
+  std::mutex cuids_mutex_;
 
   // Get table file name in where it's outputting to, which should also be in
   // `output_directory_`.

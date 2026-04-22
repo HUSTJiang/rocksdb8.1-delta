@@ -18,6 +18,7 @@
 #include "db/merge_helper.h"
 #include "db/pinned_iterators_manager.h"
 #include "db/wide/wide_column_serialization.h"
+#include "delta/delta_perf_counters.h"
 #include "file/filename.h"
 #include "logging/logging.h"
 #include "memory/arena.h"
@@ -79,6 +80,9 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
       arena_mode_(arena_mode),
       db_impl_(db_impl),
       cfd_(cfd),
+      hotspot_manager_(db_impl != nullptr ? db_impl->GetHotspotManager()
+                                          : nullptr),
+      read_options_(read_options),
       timestamp_ub_(read_options.timestamp),
       timestamp_lb_(read_options.iter_start_ts),
       timestamp_size_(timestamp_ub_ ? timestamp_ub_->size() : 0) {
@@ -92,6 +96,21 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
   status_.PermitUncheckedError();
   assert(timestamp_size_ ==
          user_comparator_.user_comparator()->timestamp_size());
+}
+
+DBIter::~DBIter() {
+  if (pinned_iters_mgr_.PinningEnabled()) {
+    pinned_iters_mgr_.ReleasePinnedData();
+  }
+  RecordTick(statistics_, NO_ITERATOR_DELETED);
+  ResetInternalKeysSkippedCounter();
+  local_stats_.BumpGlobalStatistics(statistics_);
+  iter_.DeleteIter(arena_mode_);
+  MaybeFinalizeDeltaScan();
+  delta_ctx_.Reset();
+  if (db_impl_ != nullptr && hotspot_manager_ != nullptr) {
+    db_impl_->NotifyDeltaBGWork();
+  }
 }
 
 Status DBIter::GetProperty(std::string prop_name, std::string* prop) {
@@ -231,6 +250,118 @@ bool DBIter::SetValueAndColumnsFromEntity(Slice slice) {
   if (!wide_columns_.empty() &&
       wide_columns_[0].name() == kDefaultWideColumnName) {
     value_ = wide_columns_[0].value();
+  }
+
+  return true;
+}
+
+void DBIter::MaybeFinalizeDeltaScan() {
+  if (hotspot_manager_ == nullptr || delta_ctx_.last_cuid == 0 ||
+      read_options_.is_metadata_scan) {
+    return;
+  }
+
+  auto strategy = hotspot_manager_->EvaluateScanAsCompactionStrategy(
+      delta_ctx_.last_cuid, read_options_.delta_full_scan,
+      delta_ctx_.scan_first_key, delta_ctx_.GetScanLastKey());
+  if (strategy == ScanAsCompactionStrategy::kFullReplace &&
+      !delta_ctx_.trigger_scan_as_compaction) {
+    return;
+  }
+
+  hotspot_manager_->FinalizeScanAsCompactionWithStrategy(
+      delta_ctx_.last_cuid, strategy, delta_ctx_.scan_first_key,
+      delta_ctx_.GetScanLastKey(), delta_ctx_.visited_units_for_cuid,
+      delta_ctx_.scan_data);
+}
+
+bool DBIter::HandleDeltaVisibleValue() {
+  if (hotspot_manager_ == nullptr) {
+    return true;
+  }
+
+  uint64_t cuid = hotspot_manager_->ExtractCUID(saved_key_.GetUserKey());
+  if (cuid == 0) {
+    return true;
+  }
+
+  if (delta_ctx_.cached_deleted_check_cuid != cuid) {
+    delta_ctx_.cached_cuid_is_deleted =
+        hotspot_manager_->IsCuidDeleted(cuid, sequence_);
+    delta_ctx_.cached_deleted_check_cuid = cuid;
+  }
+  if (delta_ctx_.cached_cuid_is_deleted) {
+    valid_ = false;
+    ResetBlobValue();
+    ResetValueAndColumns();
+    iter_.Next();
+    return false;
+  }
+
+  if (delta_ctx_.last_cuid != cuid) {
+    MaybeFinalizeDeltaScan();
+    delta_ctx_.last_cuid = cuid;
+    delta_ctx_.visited_units_for_cuid.clear();
+    delta_ctx_.scan_first_key.clear();
+    delta_ctx_.scan_last_key.clear();
+    delta_ctx_.scan_data.clear();
+    delta_ctx_.cached_deleted_check_cuid = 0;
+    delta_ctx_.cached_phys_id = 0;
+
+    bool became_hot = false;
+    delta_ctx_.is_current_hot = hotspot_manager_->RegisterScan(
+        cuid, read_options_.delta_full_scan, &became_hot);
+    if (became_hot) {
+      hotspot_manager_->EnqueueForInitScan(cuid);
+      delta_ctx_.trigger_scan_as_compaction = false;
+    } else if (delta_ctx_.is_current_hot && read_options_.skip_hot_path &&
+               !read_options_.is_metadata_scan) {
+      delta_ctx_.trigger_scan_as_compaction =
+          hotspot_manager_->ShouldTriggerScanAsCompaction(cuid) &&
+          hotspot_manager_->PrepareForFullReplace(cuid);
+    } else {
+      delta_ctx_.trigger_scan_as_compaction = false;
+    }
+  }
+
+  if (read_options_.delta_full_scan) {
+    uint64_t phys_id = iter_.iter() != nullptr ? iter_.iter()->GetPhysicalId()
+                                               : 0;
+    if (phys_id != 0 && delta_ctx_.cached_phys_id != phys_id) {
+      if (delta_ctx_.visited_units_for_cuid.insert(phys_id).second) {
+        hotspot_manager_->GetDeleteTable().TrackPhysicalUnit(cuid, phys_id);
+      }
+      delta_ctx_.cached_phys_id = phys_id;
+    }
+  }
+
+  bool need_internal_key =
+      delta_ctx_.scan_first_key.empty() || delta_ctx_.trigger_scan_as_compaction ||
+      (!read_options_.is_metadata_scan && !read_options_.delta_full_scan);
+  if (need_internal_key) {
+    delta_ctx_.key_encode_buf.clear();
+    AppendInternalKey(&delta_ctx_.key_encode_buf,
+                      ParsedInternalKey(saved_key_.GetUserKey(), ikey_.sequence,
+                                        ikey_.type));
+  }
+
+  if (delta_ctx_.scan_first_key.empty()) {
+    delta_ctx_.scan_first_key = delta_ctx_.key_encode_buf;
+  }
+
+  if (delta_ctx_.trigger_scan_as_compaction) {
+    delta_ctx_.scan_last_key = delta_ctx_.key_encode_buf;
+    if (hotspot_manager_->BufferHotData(cuid, Slice(delta_ctx_.key_encode_buf),
+                                        value())) {
+      hotspot_manager_->TriggerBufferFlush("FullScan", cuid);
+    }
+  } else if (!read_options_.is_metadata_scan && !read_options_.delta_full_scan) {
+    std::string value_str = value().ToString();
+    g_scan_data_rows_captured.fetch_add(1, std::memory_order_relaxed);
+    g_scan_data_bytes_captured.fetch_add(
+        delta_ctx_.key_encode_buf.size() + value_str.size(),
+        std::memory_order_relaxed);
+    delta_ctx_.scan_data.emplace_back(delta_ctx_.key_encode_buf, value_str);
   }
 
   return true;
@@ -394,6 +525,9 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
             }
 
             valid_ = true;
+            if (!HandleDeltaVisibleValue()) {
+              continue;
+            }
             return true;
             break;
           case kTypeMerge:
@@ -496,6 +630,8 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
     }
   } while (iter_.Valid());
 
+  MaybeFinalizeDeltaScan();
+  delta_ctx_.Reset();
   valid_ = false;
   return iter_.status().ok();
 }

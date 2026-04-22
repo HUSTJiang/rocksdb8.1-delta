@@ -7,6 +7,7 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #pragma once
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -14,6 +15,7 @@
 #include "db/seqno_to_time_mapping.h"
 #include "db/table_properties_collector.h"
 #include "db/version_set.h"
+#include "delta/hotspot_manager.h"
 #include "logging/event_logger.h"
 #include "options/cf_options.h"
 #include "rocksdb/comparator.h"
@@ -73,6 +75,8 @@ extern Status BuildTable(
     BlobFileCompletionCallback* blob_callback = nullptr,
     Version* version = nullptr, uint64_t* num_input_entries = nullptr,
     uint64_t* memtable_payload_bytes = nullptr,
-    uint64_t* memtable_garbage_bytes = nullptr);
+    uint64_t* memtable_garbage_bytes = nullptr,
+    std::unordered_map<uint64_t, DataSegment>* output_segments = nullptr,
+    HotspotManager* hotspot_manager = nullptr);
 
 }  // namespace ROCKSDB_NAMESPACE

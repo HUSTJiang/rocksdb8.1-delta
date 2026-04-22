@@ -25,6 +25,8 @@
 #include "db/range_tombstone_fragmenter.h"
 #include "db/version_edit.h"
 #include "db/version_set.h"
+#include "delta/diag_log.h"
+#include "delta/hotspot_manager.h"
 #include "file/file_util.h"
 #include "file/filename.h"
 #include "logging/event_logger.h"
@@ -44,6 +46,7 @@
 #include "table/two_level_iterator.h"
 #include "test_util/sync_point.h"
 #include "util/coding.h"
+#include "util/extract_cuid.h"
 #include "util/mutexlock.h"
 #include "util/stop_watch.h"
 
@@ -878,6 +881,7 @@ Status FlushJob::WriteLevel0Table() {
                          << total_memory_usage << "flush_reason"
                          << GetFlushReasonString(flush_reason_);
 
+    std::unordered_map<uint64_t, DataSegment> output_segments;
     {
       ScopedArenaIterator iter(
           NewMergingIterator(&cfd_->internal_comparator(), memtables.data(),
@@ -940,7 +944,8 @@ Status FlushJob::WriteLevel0Table() {
           BlobFileCreationReason::kFlush, seqno_to_time_mapping_, event_logger_,
           job_context_->job_id, io_priority, &table_properties_, write_hint,
           full_history_ts_low, blob_callback_, base_, &num_input_entries,
-          &memtable_payload_bytes, &memtable_garbage_bytes);
+          &memtable_payload_bytes, &memtable_garbage_bytes, &output_segments,
+          db_options_.hotspot_manager.get());
       // TODO: Cleanup io_status in BuildTable and table builders
       assert(!s.ok() || io_s.ok());
       io_s.PermitUncheckedError();
@@ -979,6 +984,40 @@ Status FlushJob::WriteLevel0Table() {
           DirFsyncOptions(DirFsyncOptions::FsyncReason::kNewFileSynced));
     }
     TEST_SYNC_POINT_CALLBACK("FlushJob::WriteLevel0Table", &mems_);
+
+    if (s.ok() && meta_.fd.GetFileSize() > 0 && db_options_.hotspot_manager) {
+      const uint64_t file_number = meta_.fd.GetNumber();
+      std::vector<uint64_t> flushed_memtable_ids;
+      flushed_memtable_ids.reserve(mems_.size());
+      for (const auto* mem : mems_) {
+        flushed_memtable_ids.push_back(reinterpret_cast<uint64_t>(mem));
+      }
+      int registered_count = 0;
+      for (const auto& kv : output_segments) {
+        const uint64_t cuid = kv.first;
+        const DataSegment& seg = kv.second;
+        if (db_options_.hotspot_manager->GetDeleteTable().IsTracked(cuid)) {
+          db_options_.hotspot_manager->UpdateFlushRefCount(
+              cuid, flushed_memtable_ids, file_number);
+        }
+        if (!seg.Valid() || !db_options_.hotspot_manager->IsHot(cuid)) {
+          continue;
+        }
+        db_options_.hotspot_manager->GetIndexTable().AddDelta(cuid, seg);
+        ++registered_count;
+        DiagLogf(
+            "[DIAG_DELTA_REGISTERED] CUID %" PRIu64
+            ": file=%" PRIu64 " registered first_key=[%s] last_key=[%s]\n",
+            cuid, file_number, FormatKeyDisplay(seg.first_key).c_str(),
+            FormatKeyDisplay(seg.last_key).c_str());
+      }
+      if (registered_count > 0) {
+        ROCKS_LOG_INFO(
+            db_options_.info_log,
+            "[%s] [FlushJob] Registered %d hot delta segments for file #%" PRIu64,
+            cfd_->GetName().c_str(), registered_count, file_number);
+      }
+    }
     db_mutex_->Lock();
   }
   base_->Unref();

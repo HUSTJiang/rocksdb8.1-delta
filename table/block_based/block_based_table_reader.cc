@@ -630,7 +630,8 @@ Status BlockBasedTable::Open(
   BlockCacheLookupContext lookup_context{TableReaderCaller::kPrefetch};
   Rep* rep = new BlockBasedTable::Rep(ioptions, env_options, table_options,
                                       internal_comparator, skip_filters,
-                                      file_size, level, immortal_table);
+                                      file_size, level, immortal_table,
+                                      cur_file_num);
   rep->file = std::move(file);
   rep->footer = footer;
 

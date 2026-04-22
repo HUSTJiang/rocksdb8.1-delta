@@ -164,6 +164,11 @@ class IteratorWrapperBase {
     return iter_->IsDeleteRangeSentinelKey();
   }
 
+  uint64_t GetPhysicalId() {
+    assert(iter_);
+    return iter_->GetPhysicalId();
+  }
+
  private:
   void Update() {
     valid_ = iter_->Valid();

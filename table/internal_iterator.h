@@ -174,6 +174,8 @@ class InternalIteratorBase : public Cleanable {
     return Status::NotSupported("");
   }
 
+  virtual uint64_t GetPhysicalId() { return 0; }
+
   // When iterator moves from one file to another file at same level, new file's
   // readahead state (details of last block read) is updated with previous
   // file's readahead state. This way internal readahead_size of Prefetch Buffer

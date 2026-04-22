@@ -110,6 +110,14 @@ class CompactionMergingIterator : public InternalIterator {
     return current_->type == HeapItem::DELETE_RANGE_START;
   }
 
+  uint64_t GetPhysicalId() override {
+    assert(Valid());
+    if (current_->type == HeapItem::ITERATOR) {
+      return current_->iter.GetPhysicalId();
+    }
+    return 0;
+  }
+
   // Compaction uses the above subset of InternalIterator interface.
   void SeekToLast() override { assert(false); }
 

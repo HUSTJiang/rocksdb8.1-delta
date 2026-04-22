@@ -374,7 +374,8 @@ class MemTableIterator : public InternalIterator {
             !mem.GetImmutableMemTableOptions()->inplace_update_support),
         protection_bytes_per_key_(mem.moptions_.protection_bytes_per_key),
         status_(Status::OK()),
-        logger_(mem.moptions_.info_log) {
+        logger_(mem.moptions_.info_log),
+        mem_(&mem) {
     if (use_range_del_table) {
       iter_ = mem.range_del_table_->GetIterator(arena);
     } else if (prefix_extractor_ != nullptr && !read_options.total_order_seek &&
@@ -518,6 +519,10 @@ class MemTableIterator : public InternalIterator {
     return value_pinned_;
   }
 
+  uint64_t GetPhysicalId() override {
+    return reinterpret_cast<uint64_t>(mem_);
+  }
+
  private:
   DynamicBloom* bloom_;
   const SliceTransform* const prefix_extractor_;
@@ -529,6 +534,7 @@ class MemTableIterator : public InternalIterator {
   size_t protection_bytes_per_key_;
   Status status_;
   Logger* logger_;
+  const MemTable* mem_;
 
   void VerifyEntryChecksum() {
     if (protection_bytes_per_key_ > 0 && Valid()) {

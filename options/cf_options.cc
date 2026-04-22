@@ -135,6 +135,69 @@ static Status ParseCompressionOptions(const std::string& value,
 const std::string kOptNameBMCompOpts = "bottommost_compression_opts";
 const std::string kOptNameCompOpts = "compression_opts";
 
+static std::unordered_map<std::string, OptionTypeInfo> delta_options_type_info = {
+    {"hotspot_scan_threshold",
+     {offsetof(struct DeltaOptions, hotspot_scan_threshold),
+      OptionType::kUInt64T, OptionVerificationType::kDeprecated,
+      OptionTypeFlags::kMutable}},
+    {"hotspot_scan_window_sec",
+     {offsetof(struct DeltaOptions, hotspot_scan_window_sec),
+      OptionType::kUInt64T, OptionVerificationType::kDeprecated,
+      OptionTypeFlags::kMutable}},
+    {"delta_merge_threshold",
+     {offsetof(struct DeltaOptions, delta_merge_threshold),
+      OptionType::kUInt32T, OptionVerificationType::kDeprecated,
+      OptionTypeFlags::kMutable}},
+    {"sac_delta_count_threshold",
+     {offsetof(struct DeltaOptions, sac_delta_count_threshold),
+      OptionType::kUInt32T, OptionVerificationType::kDeprecated,
+      OptionTypeFlags::kMutable}},
+    {"hot_data_buffer_threshold_bytes",
+     {offsetof(struct DeltaOptions, hot_data_buffer_threshold_bytes),
+      OptionType::kSizeT, OptionVerificationType::kDeprecated,
+      OptionTypeFlags::kMutable}},
+    {"hot_data_buffer_shards",
+     {offsetof(struct DeltaOptions, hot_data_buffer_shards),
+      OptionType::kUInt32T, OptionVerificationType::kDeprecated,
+      OptionTypeFlags::kMutable}},
+    {"gdct_log_compact_size",
+     {offsetof(struct DeltaOptions, gdct_log_compact_size),
+      OptionType::kUInt64T, OptionVerificationType::kDeprecated,
+      OptionTypeFlags::kMutable}},
+    {"gdct_flush_threshold_records",
+     {offsetof(struct DeltaOptions, gdct_flush_threshold_records),
+      OptionType::kUInt32T, OptionVerificationType::kDeprecated,
+      OptionTypeFlags::kMutable}},
+    {"gdct_flush_interval_us",
+     {offsetof(struct DeltaOptions, gdct_flush_interval_us),
+      OptionType::kUInt64T, OptionVerificationType::kDeprecated,
+      OptionTypeFlags::kMutable}},
+    {"gdct_compact_interval_us",
+     {offsetof(struct DeltaOptions, gdct_compact_interval_us),
+      OptionType::kUInt64T, OptionVerificationType::kDeprecated,
+      OptionTypeFlags::kMutable}},
+    {"compaction_l0_trigger_count",
+     {offsetof(struct DeltaOptions, compaction_l0_trigger_count),
+      OptionType::kInt, OptionVerificationType::kDeprecated,
+      OptionTypeFlags::kMutable}},
+    {"compaction_l0_trigger_age_sec",
+     {offsetof(struct DeltaOptions, compaction_l0_trigger_age_sec),
+      OptionType::kUInt64T, OptionVerificationType::kDeprecated,
+      OptionTypeFlags::kMutable}},
+    {"compaction_l0_files_to_pick",
+     {offsetof(struct DeltaOptions, compaction_l0_files_to_pick),
+      OptionType::kSizeT, OptionVerificationType::kDeprecated,
+      OptionTypeFlags::kMutable}},
+    {"max_delta_threads",
+     {offsetof(struct DeltaOptions, max_delta_threads),
+      OptionType::kInt, OptionVerificationType::kDeprecated,
+      OptionTypeFlags::kMutable}},
+    {"sharding_count",
+     {offsetof(struct DeltaOptions, sharding_count),
+      OptionType::kUInt32T, OptionVerificationType::kDeprecated,
+      OptionTypeFlags::kMutable}},
+};
+
 // OptionTypeInfo map for CompressionOptions
 static std::unordered_map<std::string, OptionTypeInfo>
     compression_options_type_info = {
@@ -524,6 +587,11 @@ static std::unordered_map<std::string, OptionTypeInfo>
                      name, value, addr);
                }
              })},
+        {"delta_options",
+         OptionTypeInfo::Struct(
+             "delta_options", &delta_options_type_info,
+             offsetof(struct MutableCFOptions, delta_options),
+             OptionVerificationType::kDeprecated, OptionTypeFlags::kMutable)},
         // End special case properties
 };
 

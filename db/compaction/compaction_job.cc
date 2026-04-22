@@ -55,9 +55,127 @@
 #include "table/table_builder.h"
 #include "table/unique_id_impl.h"
 #include "test_util/sync_point.h"
+#include "util/extract_cuid.h"
 #include "util/stop_watch.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+struct DeltaCompactionContext {
+  std::shared_ptr<HotspotManager> manager;
+  std::vector<CompactionJob::DeltaOutputInfo>* pending_outputs = nullptr;
+
+  uint64_t current_cuid = 0;
+  uint64_t current_file_number = 0;
+  std::string current_first_key;
+  std::string current_last_key;
+  uint64_t current_entry_count = 0;
+  std::unordered_set<uint64_t> current_input_files;
+
+  // Cache each input delta file's registered segment ends for the current CUID.
+  std::unordered_map<uint64_t, std::vector<uint64_t>> input_file_seg_ends;
+  bool has_started_segment = false;
+
+  void FlushSegment(uint64_t actual_file_number) {
+    if (current_cuid != 0 && actual_file_number != 0 && pending_outputs &&
+        current_entry_count > 0) {
+      pending_outputs->push_back(
+          CompactionJob::DeltaOutputInfo{current_cuid, actual_file_number,
+                                         current_first_key, current_last_key,
+                                         current_entry_count});
+    }
+
+    current_first_key.clear();
+    current_last_key.clear();
+    current_entry_count = 0;
+    current_input_files.clear();
+    has_started_segment = false;
+  }
+
+  void HandleFileSwitch(uint64_t old_file_number, uint64_t new_file_number) {
+    FlushSegment(old_file_number);
+    current_file_number = new_file_number;
+  }
+
+  void ResetForCuid(uint64_t cuid, uint64_t output_file_number) {
+    FlushSegment(current_file_number);
+    current_cuid = cuid;
+    current_file_number = output_file_number;
+    input_file_seg_ends.clear();
+  }
+
+  void CacheInputFileSegments(uint64_t input_file_number) {
+    if (!manager || input_file_number == 0 ||
+        input_file_seg_ends.count(input_file_number) != 0) {
+      return;
+    }
+
+    HotIndexEntry index_entry;
+    std::vector<uint64_t> segment_ends;
+    if (manager->GetIndexTable().GetEntry(current_cuid, &index_entry)) {
+      for (const auto& segment : index_entry.deltas) {
+        if (segment.file_number == input_file_number) {
+          uint64_t last_rid = ExtractRowID(Slice(segment.last_key));
+          if (last_rid != 0) {
+            segment_ends.push_back(last_rid);
+          }
+        }
+      }
+      std::sort(segment_ends.begin(), segment_ends.end());
+    }
+
+    input_file_seg_ends[input_file_number] = std::move(segment_ends);
+  }
+
+  bool CrossedRegisteredSegmentBoundary(uint64_t input_file_number,
+                                        const Slice& current_key) const {
+    auto it = input_file_seg_ends.find(input_file_number);
+    if (it == input_file_seg_ends.end() || it->second.empty() ||
+        current_last_key.empty()) {
+      return false;
+    }
+
+    uint64_t previous_rid = ExtractRowID(Slice(current_last_key));
+    uint64_t current_rid = ExtractRowID(current_key);
+    if (previous_rid == 0 || current_rid == 0) {
+      return false;
+    }
+
+    for (uint64_t segment_end : it->second) {
+      if (previous_rid <= segment_end && current_rid > segment_end) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool HasRowGapFromLastKey(const Slice& current_key) const {
+    if (current_last_key.empty()) {
+      return false;
+    }
+    uint64_t previous_rid = ExtractRowID(Slice(current_last_key));
+    uint64_t current_rid = ExtractRowID(current_key);
+    return previous_rid != 0 && current_rid != 0 &&
+           current_rid > previous_rid + 1;
+  }
+
+  void AddCurrentKey(uint64_t cuid, uint64_t output_file_number,
+                     uint64_t input_file_number, const Slice& key) {
+    if (cuid == 0 || output_file_number == 0) {
+      return;
+    }
+    current_cuid = cuid;
+    current_file_number = output_file_number;
+    if (!has_started_segment) {
+      current_first_key.assign(key.data(), key.size());
+      has_started_segment = true;
+    }
+    current_last_key.assign(key.data(), key.size());
+    ++current_entry_count;
+    if (input_file_number != 0) {
+      current_input_files.insert(input_file_number);
+    }
+  }
+};
 
 const char* GetCompactionReasonString(CompactionReason compaction_reason) {
   switch (compaction_reason) {
@@ -145,7 +263,8 @@ CompactionJob::CompactionJob(
     const std::string& db_id, const std::string& db_session_id,
     std::string full_history_ts_low, std::string trim_ts,
     BlobFileCompletionCallback* blob_callback, int* bg_compaction_scheduled,
-    int* bg_bottom_compaction_scheduled)
+    int* bg_bottom_compaction_scheduled,
+    std::shared_ptr<HotspotManager> hotspot_manager)
     : compact_(new CompactionState(compaction)),
       compaction_stats_(compaction->compaction_reason(), 1),
       db_options_(db_options),
@@ -187,7 +306,8 @@ CompactionJob::CompactionJob(
       blob_callback_(blob_callback),
       extra_num_subcompaction_threads_reserved_(0),
       bg_compaction_scheduled_(bg_compaction_scheduled),
-      bg_bottom_compaction_scheduled_(bg_bottom_compaction_scheduled) {
+      bg_bottom_compaction_scheduled_(bg_bottom_compaction_scheduled),
+      hotspot_manager_(std::move(hotspot_manager)) {
   assert(compaction_job_stats_ != nullptr);
   assert(log_buffer_ != nullptr);
 
@@ -827,6 +947,47 @@ Status CompactionJob::Install(const MutableCFOptions& mutable_cf_options) {
 
   if (status.ok()) {
     status = InstallCompactionResults(mutable_cf_options);
+    if (status.ok() && hotspot_manager_) {
+      std::map<uint64_t, std::vector<DeltaOutputInfo>> output_map;
+      for (const auto& output : global_outputs_) {
+        output_map[output.cuid].push_back(output);
+      }
+
+      for (const auto& entry : global_cuid_inputs_) {
+        uint64_t cuid = entry.first;
+        std::vector<uint64_t> input_files(entry.second.begin(),
+                                          entry.second.end());
+        std::sort(input_files.begin(), input_files.end());
+
+        auto out_it = output_map.find(cuid);
+        std::unordered_set<uint64_t> unique_output_files;
+        if (out_it != output_map.end()) {
+          for (const auto& output : out_it->second) {
+            unique_output_files.insert(output.file_number);
+          }
+        }
+        std::vector<uint64_t> output_files(unique_output_files.begin(),
+                                           unique_output_files.end());
+        std::sort(output_files.begin(), output_files.end());
+
+        hotspot_manager_->UpdateCompactionRefCount(cuid, input_files,
+                                                   output_files);
+
+        if (out_it != output_map.end()) {
+          for (const auto& output : out_it->second) {
+            hotspot_manager_->UpdateCompactionDelta(
+                cuid, input_files, output.file_number, output.first_key,
+                output.last_key);
+          }
+        } else {
+          hotspot_manager_->GetIndexTable().RemoveObsoleteDeltasForCUIDs(
+              {cuid}, input_files);
+        }
+      }
+
+      global_cuid_inputs_.clear();
+      global_outputs_.clear();
+    }
   }
   if (!versions_->io_status().ok()) {
     io_status_ = versions_->io_status();
@@ -1252,7 +1413,16 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
       db_options_.enforce_single_del_contracts, manual_compaction_canceled_,
       sub_compact->compaction, compaction_filter, shutting_down_,
       db_options_.info_log, full_history_ts_low, preserve_time_min_seqno_,
-      preclude_last_level_min_seqno_);
+      preclude_last_level_min_seqno_, hotspot_manager_);
+
+  std::unordered_set<uint64_t> local_involved_cuids;
+  std::map<uint64_t, std::unordered_set<uint64_t>> local_inputs;
+  std::vector<DeltaOutputInfo> local_outputs;
+  DeltaCompactionContext delta_ctx;
+  delta_ctx.manager = hotspot_manager_;
+  delta_ctx.pending_outputs = &local_outputs;
+  c_iter->SetInvolvedCuids(&local_involved_cuids);
+  c_iter->SetInputMap(&local_inputs);
   c_iter->SeekToFirst();
 
   // Assign range delete aggregator to the target output level, which makes sure
@@ -1264,14 +1434,21 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   // define the open and close functions for the compaction files, which will be
   // used open/close output files when needed.
   const CompactionFileOpenFunc open_file_func =
-      [this, sub_compact](CompactionOutputs& outputs) {
-        return this->OpenCompactionOutputFile(sub_compact, outputs);
+      [this, sub_compact, &delta_ctx](CompactionOutputs& outputs) {
+        Status s = this->OpenCompactionOutputFile(sub_compact, outputs);
+        if (s.ok() && delta_ctx.manager && outputs.HasBuilder()) {
+          delta_ctx.current_file_number = outputs.GetMetaData()->fd.GetNumber();
+        }
+        return s;
       };
 
   const CompactionFileCloseFunc close_file_func =
-      [this, sub_compact, start_user_key, end_user_key](
+      [this, sub_compact, start_user_key, end_user_key, &delta_ctx](
           CompactionOutputs& outputs, const Status& status,
           const Slice& next_table_min_key) {
+        if (delta_ctx.manager && outputs.HasBuilder()) {
+          delta_ctx.HandleFileSwitch(outputs.GetMetaData()->fd.GetNumber(), 0);
+        }
         return this->FinishCompactionOutputFile(
             status, sub_compact, outputs, next_table_min_key,
             sub_compact->start.has_value() ? &start_user_key : nullptr,
@@ -1304,6 +1481,49 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
     status = sub_compact->AddToOutput(*c_iter, open_file_func, close_file_func);
     if (!status.ok()) {
       break;
+    }
+
+    if (hotspot_manager_ && !c_iter->IsDeleteRangeSentinelKey() &&
+        sub_compact->Current().HasBuilder()) {
+      const Slice& key = c_iter->key();
+      uint64_t output_file =
+          sub_compact->Current().GetMetaData()->fd.GetNumber();
+      uint64_t cuid = hotspot_manager_->ExtractCUID(key);
+      uint64_t input_file = c_iter->input_file_number();
+
+      if (cuid != delta_ctx.current_cuid) {
+        delta_ctx.ResetForCuid(cuid, output_file);
+        // Discard a stale begin-of-CUID gap signal. It only matters after a
+        // segment has started for the same CUID.
+        c_iter->ConsumeSkipGap();
+      } else {
+        uint64_t gap_cuid = c_iter->ConsumeSkipGap();
+        if (gap_cuid == cuid && delta_ctx.has_started_segment) {
+          delta_ctx.FlushSegment(delta_ctx.current_file_number);
+        } else if (delta_ctx.has_started_segment && input_file != 0 &&
+                   delta_ctx.current_input_files.count(input_file) == 0 &&
+                   delta_ctx.HasRowGapFromLastKey(key)) {
+          delta_ctx.FlushSegment(delta_ctx.current_file_number);
+        }
+
+        delta_ctx.CacheInputFileSegments(input_file);
+        if (delta_ctx.has_started_segment && input_file != 0 &&
+            delta_ctx.current_input_files.count(input_file) != 0 &&
+            delta_ctx.CrossedRegisteredSegmentBoundary(input_file, key)) {
+          delta_ctx.FlushSegment(delta_ctx.current_file_number);
+        }
+
+        if (delta_ctx.has_started_segment && input_file != 0 &&
+            delta_ctx.current_input_files.count(input_file) != 0 &&
+            delta_ctx.HasRowGapFromLastKey(key)) {
+          delta_ctx.FlushSegment(delta_ctx.current_file_number);
+        }
+      }
+
+      if (delta_ctx.current_file_number != output_file) {
+        delta_ctx.HandleFileSwitch(delta_ctx.current_file_number, output_file);
+      }
+      delta_ctx.AddCurrentKey(cuid, output_file, input_file, key);
     }
 
     TEST_SYNC_POINT_CALLBACK(
@@ -1367,6 +1587,8 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
     status = c_iter->status();
   }
 
+  delta_ctx.FlushSegment(delta_ctx.current_file_number);
+
   // Call FinishCompactionOutputFile() even if status is not ok: it needs to
   // close the output files. Open file function is also passed, in case there's
   // only range-dels, no file was opened, to save the range-dels, it need to
@@ -1418,6 +1640,22 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   blob_counter.reset();
   clip.reset();
   raw_input.reset();
+  if (hotspot_manager_ && status.ok()) {
+    {
+      std::lock_guard<std::mutex> lock(delta_mutex_);
+      for (const auto& entry : local_inputs) {
+        global_cuid_inputs_[entry.first].insert(entry.second.begin(),
+                                                entry.second.end());
+      }
+      global_outputs_.insert(global_outputs_.end(), local_outputs.begin(),
+                             local_outputs.end());
+    }
+    if (!local_involved_cuids.empty()) {
+      std::lock_guard<std::mutex> lock(cuids_mutex_);
+      compaction_involved_cuids_.insert(local_involved_cuids.begin(),
+                                        local_involved_cuids.end());
+    }
+  }
   sub_compact->status = status;
   NotifyOnSubcompactionCompleted(sub_compact);
 }

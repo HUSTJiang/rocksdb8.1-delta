@@ -36,7 +36,8 @@ CompactionIterator::CompactionIterator(
     const std::shared_ptr<Logger> info_log,
     const std::string* full_history_ts_low,
     const SequenceNumber preserve_time_min_seqno,
-    const SequenceNumber preclude_last_level_min_seqno)
+    const SequenceNumber preclude_last_level_min_seqno,
+    std::shared_ptr<HotspotManager> hotspot_manager)
     : CompactionIterator(
           input, cmp, merge_helper, last_sequence, snapshots,
           earliest_write_conflict_snapshot, job_snapshot, snapshot_checker, env,
@@ -46,7 +47,8 @@ CompactionIterator::CompactionIterator(
           std::unique_ptr<CompactionProxy>(
               compaction ? new RealCompaction(compaction) : nullptr),
           compaction_filter, shutting_down, info_log, full_history_ts_low,
-          preserve_time_min_seqno, preclude_last_level_min_seqno) {}
+          preserve_time_min_seqno, preclude_last_level_min_seqno,
+          std::move(hotspot_manager)) {}
 
 CompactionIterator::CompactionIterator(
     InternalIterator* input, const Comparator* cmp, MergeHelper* merge_helper,
@@ -64,7 +66,8 @@ CompactionIterator::CompactionIterator(
     const std::shared_ptr<Logger> info_log,
     const std::string* full_history_ts_low,
     const SequenceNumber preserve_time_min_seqno,
-    const SequenceNumber preclude_last_level_min_seqno)
+    const SequenceNumber preclude_last_level_min_seqno,
+    std::shared_ptr<HotspotManager> hotspot_manager)
     : input_(input, cmp,
              !compaction || compaction->DoesInputReferenceBlobFiles()),
       cmp_(cmp),
@@ -109,7 +112,8 @@ CompactionIterator::CompactionIterator(
       cmp_with_history_ts_low_(0),
       level_(compaction_ == nullptr ? 0 : compaction_->level()),
       preserve_time_min_seqno_(preserve_time_min_seqno),
-      preclude_last_level_min_seqno_(preclude_last_level_min_seqno) {
+      preclude_last_level_min_seqno_(preclude_last_level_min_seqno),
+      hotspot_manager_(std::move(hotspot_manager)) {
   assert(snapshots_ != nullptr);
   assert(preserve_time_min_seqno_ <= preclude_last_level_min_seqno_);
 
@@ -454,12 +458,61 @@ bool CompactionIterator::InvokeFilterIfNeeded(bool* need_skip,
   return true;
 }
 
+void CompactionIterator::CheckHotspotFilters() {
+  if (hotspot_manager_ == nullptr || !input_.Valid()) {
+    return;
+  }
+
+  uint64_t cuid = hotspot_manager_->ExtractCUID(input_.key());
+  uint64_t file_id = input_.GetPhysicalId();
+  if (cuid != current_cuid_ || file_id != current_file_number_) {
+    if (skip_current_cuid_ && cuid == current_cuid_ && cuid != 0) {
+      cuid_gap_after_skip_ = cuid;
+    }
+
+    if (involved_cuids_ != nullptr && cuid != 0) {
+      involved_cuids_->insert(cuid);
+    }
+    if (input_map_ != nullptr && cuid != 0 && file_id != 0) {
+      (*input_map_)[cuid].insert(file_id);
+    }
+
+    current_cuid_ = cuid;
+    current_file_number_ = file_id;
+    skip_current_cuid_ = false;
+
+    if (cuid == 0) {
+      return;
+    }
+
+    if (hotspot_manager_->GetDeleteTable().IsDeleted(cuid,
+                                                     earliest_snapshot_)) {
+      skip_current_cuid_ = true;
+      return;
+    }
+
+    if (file_id != 0 && hotspot_manager_->IsHot(cuid) &&
+        hotspot_manager_->ShouldSkipObsoleteDelta(
+            cuid, std::vector<uint64_t>{file_id})) {
+      skip_current_cuid_ = true;
+    }
+  }
+}
+
 void CompactionIterator::NextFromInput() {
   at_next_ = false;
   validity_info_.Invalidate();
 
   while (!Valid() && input_.Valid() && !IsPausingManualCompaction() &&
          !IsShuttingDown()) {
+    if (hotspot_manager_ != nullptr) {
+      CheckHotspotFilters();
+      if (skip_current_cuid_) {
+        ++iter_stats_.num_record_drop_obsolete;
+        input_.Next();
+        continue;
+      }
+    }
     key_ = input_.key();
     value_ = input_.value();
     blob_value_.Reset();

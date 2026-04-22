@@ -172,7 +172,8 @@ struct MutableCFOptions {
             options.memtable_protection_bytes_per_key),
         sample_for_compression(
             options.sample_for_compression),  // TODO: is 0 fine here?
-        compression_per_level(options.compression_per_level) {
+        compression_per_level(options.compression_per_level),
+        delta_options(options.delta_options) {
     RefreshDerivedOptions(options.num_levels, options.compaction_style);
   }
 
@@ -313,6 +314,7 @@ struct MutableCFOptions {
 
   uint64_t sample_for_compression;
   std::vector<CompressionType> compression_per_level;
+  DeltaOptions delta_options;
 
   // Derived options
   // Per-level target file size.

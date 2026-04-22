@@ -33,6 +33,8 @@
 #include "db/dbformat.h"
 #include "db/error_handler.h"
 #include "db/event_helpers.h"
+#include "delta/hot_iterators.h"
+#include "delta/hotspot_manager.h"
 #include "db/external_sst_file_ingestion_job.h"
 #include "db/flush_job.h"
 #include "db/forward_iterator.h"
@@ -292,6 +294,27 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
   }
 }
 
+void DBImpl::InitializeHotspotManager(const Options& options) {
+  if (!immutable_db_options_.enable_delta || hotspot_manager_ != nullptr) {
+    return;
+  }
+
+  std::string hotspot_dir = dbname_ + "/hotspot_data";
+  auto* default_cfd = versions_->GetColumnFamilySet()->GetDefault();
+  if (default_cfd == nullptr) {
+    return;
+  }
+
+  hotspot_manager_ = std::make_shared<HotspotManager>(
+      options, hotspot_dir, &default_cfd->internal_comparator());
+  immutable_db_options_.hotspot_manager = hotspot_manager_;
+  ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                 "[DBImpl] HotspotManager initialized at %s",
+                 hotspot_dir.c_str());
+  mutex_.AssertHeld();
+  MaybeScheduleDeltaWork();
+}
+
 Status DBImpl::Resume() {
   ROCKS_LOG_INFO(immutable_db_options_.info_log, "Resuming DB");
 
@@ -479,7 +502,7 @@ Status DBImpl::ResumeImpl(DBRecoverContext context) {
 void DBImpl::WaitForBackgroundWork() {
   // Wait for background work to finish
   while (bg_bottom_compaction_scheduled_ || bg_compaction_scheduled_ ||
-         bg_flush_scheduled_) {
+         bg_flush_scheduled_ || bg_delta_scheduled_) {
     bg_cv_.Wait();
   }
 }
@@ -578,7 +601,7 @@ Status DBImpl::CloseHelper() {
 
   // Wait for background work to finish
   while (bg_bottom_compaction_scheduled_ || bg_compaction_scheduled_ ||
-         bg_flush_scheduled_ || bg_purge_scheduled_ ||
+         bg_flush_scheduled_ || bg_purge_scheduled_ || bg_delta_scheduled_ ||
          pending_purge_obsolete_files_ ||
          error_handler_.IsRecoveryInProgress()) {
     TEST_SYNC_POINT("DBImpl::~DBImpl:WaitJob");
@@ -1840,6 +1863,7 @@ InternalIterator* DBImpl::NewInternalIterator(
     SuperVersion* super_version, Arena* arena, SequenceNumber sequence,
     bool allow_unprepared_value, ArenaWrappedDBIter* db_iter) {
   InternalIterator* internal_iter;
+  DeltaSwitchingIterator* switching_iter_ptr = nullptr;
   assert(arena != nullptr);
   // Need to create internal iterator from the arena.
   MergeIteratorBuilder merge_iter_builder(
@@ -1877,9 +1901,17 @@ InternalIterator* DBImpl::NewInternalIterator(
   if (s.ok()) {
     // Collect iterators for files in L0 - Ln
     if (read_options.read_tier != kMemtableTier) {
-      super_version->current->AddIterators(read_options, file_options_,
-                                           &merge_iter_builder,
-                                           allow_unprepared_value);
+      if (hotspot_manager_ != nullptr) {
+        switching_iter_ptr = new DeltaSwitchingIterator(
+            super_version->current, hotspot_manager_.get(), read_options,
+            file_options_, cfd->internal_comparator(),
+            super_version->mutable_cf_options, arena);
+        merge_iter_builder.AddIterator(switching_iter_ptr);
+      } else {
+        super_version->current->AddIterators(read_options, file_options_,
+                                             &merge_iter_builder,
+                                             allow_unprepared_value);
+      }
     }
     internal_iter = merge_iter_builder.Finish(
         read_options.ignore_range_deletions ? nullptr : db_iter);
@@ -5964,6 +5996,339 @@ void DBImpl::RecordSeqnoToTimeMapping() {
                    "Failed to insert sequence number to time entry: %" PRIu64
                    " -> %" PRIu64,
                    seqno, unix_time);
+  }
+}
+
+void DBImpl::ProcessPendingHotCuids() {
+  if (hotspot_manager_ == nullptr) {
+    return;
+  }
+
+  auto pending_cuids = hotspot_manager_->PopPendingInitCuids(32);
+  for (uint64_t cuid : pending_cuids) {
+    std::string start_key(40, '\0');
+    std::string upper_bound_key(40, '\0');
+    unsigned char* start = reinterpret_cast<unsigned char*>(&start_key[16]);
+    unsigned char* upper =
+        reinterpret_cast<unsigned char*>(&upper_bound_key[16]);
+    for (int i = 0; i < 8; ++i) {
+      start[i] = static_cast<unsigned char>((cuid >> (56 - 8 * i)) & 0xFF);
+      upper[i] =
+          static_cast<unsigned char>(((cuid + 1) >> (56 - 8 * i)) & 0xFF);
+    }
+
+    ReadOptions read_opts;
+    read_opts.delta_full_scan = true;
+    read_opts.skip_hot_path = true;
+    Slice upper_bound_slice(upper_bound_key);
+    read_opts.iterate_upper_bound = &upper_bound_slice;
+
+    ColumnFamilyHandle* cfh = DefaultColumnFamily();
+    if (cfh == nullptr) {
+      hotspot_manager_->UnlockCuid(cuid);
+      continue;
+    }
+
+    std::unique_ptr<Iterator> iter(NewIterator(read_opts, cfh));
+    for (iter->Seek(start_key); iter->Valid(); iter->Next()) {
+    }
+
+    if (!iter->status().ok()) {
+      ROCKS_LOG_ERROR(immutable_db_options_.info_log,
+                      "[DBImpl] Init scan failed for CUID %" PRIu64 ": %s",
+                      cuid, iter->status().ToString().c_str());
+    }
+    hotspot_manager_->UnlockCuid(cuid);
+  }
+}
+
+void DBImpl::ProcessPendingMetadataScans() {
+  if (hotspot_manager_ == nullptr) {
+    return;
+  }
+
+  auto pending_cuids = hotspot_manager_->PopPendingMetadataScans(32);
+  for (uint64_t cuid : pending_cuids) {
+    std::string start_key(40, '\0');
+    std::string upper_bound_key(40, '\0');
+    unsigned char* start = reinterpret_cast<unsigned char*>(&start_key[16]);
+    unsigned char* upper =
+        reinterpret_cast<unsigned char*>(&upper_bound_key[16]);
+    for (int i = 0; i < 8; ++i) {
+      start[i] = static_cast<unsigned char>((cuid >> (56 - 8 * i)) & 0xFF);
+      upper[i] =
+          static_cast<unsigned char>(((cuid + 1) >> (56 - 8 * i)) & 0xFF);
+    }
+
+    ReadOptions read_opts;
+    read_opts.delta_full_scan = true;
+    read_opts.skip_hot_path = true;
+    read_opts.is_metadata_scan = true;
+    Slice upper_bound_slice(upper_bound_key);
+    read_opts.iterate_upper_bound = &upper_bound_slice;
+
+    ColumnFamilyHandle* cfh = DefaultColumnFamily();
+    if (cfh == nullptr) {
+      continue;
+    }
+
+    std::unique_ptr<Iterator> iter(NewIterator(read_opts, cfh));
+    for (iter->Seek(start_key); iter->Valid(); iter->Next()) {
+    }
+
+    if (!iter->status().ok()) {
+      ROCKS_LOG_ERROR(
+          immutable_db_options_.info_log,
+          "[DBImpl] Metadata scan failed for CUID %" PRIu64 ": %s", cuid,
+          iter->status().ToString().c_str());
+    }
+  }
+}
+
+namespace {
+class ScanDataIterator : public InternalIterator {
+ public:
+  explicit ScanDataIterator(
+      const std::vector<std::pair<std::string, std::string>>& data)
+      : data_(data), it_(data_.begin()) {}
+
+  bool Valid() const override { return it_ != data_.end(); }
+
+  void SeekToFirst() override { it_ = data_.begin(); }
+
+  void SeekToLast() override {
+    if (data_.empty()) {
+      it_ = data_.end();
+    } else {
+      it_ = data_.end() - 1;
+    }
+  }
+
+  void Seek(const Slice& target) override {
+    it_ = std::lower_bound(
+        data_.begin(), data_.end(), target,
+        [](const std::pair<std::string, std::string>& entry,
+           const Slice& key) { return Slice(entry.first).compare(key) < 0; });
+  }
+
+  void SeekForPrev(const Slice& target) override {
+    Seek(target);
+    if (!Valid()) {
+      SeekToLast();
+    } else if (Slice(it_->first).compare(target) > 0) {
+      Prev();
+    }
+  }
+
+  void Next() override {
+    if (Valid()) {
+      ++it_;
+    }
+  }
+
+  void Prev() override {
+    if (it_ == data_.begin()) {
+      it_ = data_.end();
+    } else if (it_ != data_.end()) {
+      --it_;
+    }
+  }
+
+  Slice key() const override { return Slice(it_->first); }
+  Slice value() const override { return Slice(it_->second); }
+  Status status() const override { return Status::OK(); }
+
+ private:
+  const std::vector<std::pair<std::string, std::string>>& data_;
+  std::vector<std::pair<std::string, std::string>>::const_iterator it_;
+};
+}  // namespace
+
+void DBImpl::ProcessPendingPartialMerge() {
+  if (hotspot_manager_ == nullptr) {
+    return;
+  }
+
+  ColumnFamilyHandle* cfh = DefaultColumnFamily();
+  if (cfh == nullptr) {
+    return;
+  }
+  auto* cfd = static_cast_with_check<ColumnFamilyHandleImpl>(cfh)->cfd();
+  if (cfd == nullptr) {
+    return;
+  }
+
+  SuperVersion* sv = GetAndRefSuperVersion(cfd);
+  if (sv == nullptr) {
+    return;
+  }
+
+  ReadOptions read_opts;
+  const MutableCFOptions& mutable_cf_opts = *cfd->GetLatestMutableCFOptions();
+  const auto& icmp = cfd->internal_comparator();
+
+  const int kBatchSize = 32;
+  int processed = 0;
+  while (processed < kBatchSize) {
+    PartialMergePendingTask task;
+    if (!hotspot_manager_->PopPendingPartialMerge(&task)) {
+      break;
+    }
+    ++processed;
+
+    std::vector<DataSegment> overlapping_snaps;
+    std::vector<DataSegment> overlapping_deltas;
+    hotspot_manager_->GetIndexTable().GetOverlappingSegments(
+        task.cuid, task.scan_first_key, task.scan_last_key, &overlapping_snaps,
+        &overlapping_deltas);
+
+    if (overlapping_snaps.empty() && overlapping_deltas.empty()) {
+      DataSegment new_segment;
+      new_segment.file_number = static_cast<uint64_t>(-1);
+      new_segment.first_key = task.scan_first_key;
+      new_segment.last_key = task.scan_last_key;
+      hotspot_manager_->GetIndexTable().ReplaceOverlappingSegments(
+          task.cuid, new_segment, std::vector<DataSegment>{});
+      hotspot_manager_->FinalizePmPendingSnapshots(task.cuid);
+      hotspot_manager_->UnlockCuid(task.cuid);
+      continue;
+    }
+
+    std::vector<InternalIterator*> children;
+    if (!overlapping_snaps.empty()) {
+      children.push_back(new HotSnapshotIterator(
+          overlapping_snaps, task.cuid, hotspot_manager_.get(),
+          cfd->table_cache(), read_opts, file_options_, icmp, mutable_cf_opts,
+          hotspot_manager_->GetLifecycleManager()));
+    }
+    if (!overlapping_deltas.empty()) {
+      children.push_back(new HotDeltaIterator(
+          overlapping_deltas, task.cuid, cfd->table_cache(), read_opts,
+          file_options_, icmp, mutable_cf_opts, false));
+    }
+    if (!task.scan_data.empty()) {
+      children.push_back(new ScanDataIterator(task.scan_data));
+    }
+
+    if (children.empty()) {
+      hotspot_manager_->FinalizePmPendingSnapshots(task.cuid);
+      hotspot_manager_->UnlockCuid(task.cuid);
+      continue;
+    }
+
+    std::unique_ptr<InternalIterator> merging_iter(
+        NewMergingIterator(&icmp, children.data(),
+                           static_cast<int>(children.size())));
+
+    std::string last_user_key;
+    std::string segment_first_key;
+    std::string segment_last_key;
+    size_t written_count = 0;
+    for (merging_iter->SeekToFirst(); merging_iter->Valid();
+         merging_iter->Next()) {
+      Slice key = merging_iter->key();
+      uint64_t current_cuid = hotspot_manager_->ExtractCUID(key);
+      if (current_cuid > task.cuid) {
+        break;
+      }
+      if (current_cuid < task.cuid) {
+        continue;
+      }
+
+      Slice user_key = ExtractUserKey(key);
+      if (!last_user_key.empty() &&
+          icmp.user_comparator()->Compare(user_key, last_user_key) == 0) {
+        continue;
+      }
+      last_user_key.assign(user_key.data(), user_key.size());
+
+      hotspot_manager_->BufferHotData(task.cuid, key, merging_iter->value());
+      if (segment_first_key.empty()) {
+        segment_first_key.assign(key.data(), key.size());
+      }
+      segment_last_key.assign(key.data(), key.size());
+      ++written_count;
+    }
+
+    if (written_count > 0) {
+      auto pm_sst_segs = hotspot_manager_->SwapOutPmPending(task.cuid);
+      auto pm_promoted_segs = hotspot_manager_->SwapOutPmPromoted(task.cuid);
+      std::string buf_min;
+      std::string buf_max;
+      bool has_buf_data = hotspot_manager_->GetBufferBoundaryKeys(
+          task.cuid, &buf_min, &buf_max);
+      std::vector<DataSegment> obsolete_segments = overlapping_deltas;
+      hotspot_manager_->GetIndexTable().AtomicReplaceForPartialMerge(
+          task.cuid, segment_first_key, segment_last_key, pm_sst_segs,
+          pm_promoted_segs, has_buf_data, buf_min, buf_max,
+          obsolete_segments);
+      hotspot_manager_->FinalizePmPendingSnapshots(task.cuid);
+      if (hotspot_manager_->BufferExceedsThreshold()) {
+        hotspot_manager_->TriggerBufferFlush("PartialMerge", task.cuid);
+      }
+    } else {
+      hotspot_manager_->FinalizePmPendingSnapshots(task.cuid);
+    }
+    hotspot_manager_->UnlockCuid(task.cuid);
+  }
+
+  ReturnAndCleanupSuperVersion(cfd, sv);
+}
+
+void DBImpl::NotifyDeltaBGWork() {
+  InstrumentedMutexLock l(&mutex_);
+  MaybeScheduleDeltaWork();
+}
+
+void DBImpl::BGWorkDelta(void* arg) {
+  reinterpret_cast<DBImpl*>(arg)->BackgroundDeltaWork();
+}
+
+void DBImpl::MaybeScheduleDeltaWork() {
+  mutex_.AssertHeld();
+  if (shutting_down_.load(std::memory_order_acquire)) {
+    return;
+  }
+
+  int max_delta_threads = 1;
+  auto* default_cfd = versions_->GetColumnFamilySet()->GetDefault();
+  if (default_cfd != nullptr) {
+    max_delta_threads = default_cfd->GetLatestMutableCFOptions()
+                            ->delta_options.max_delta_threads;
+  }
+  if (max_delta_threads <= 0 || bg_delta_scheduled_ >= max_delta_threads) {
+    return;
+  }
+
+  bool has_work =
+      hotspot_manager_ != nullptr &&
+      (hotspot_manager_->HasPendingInitCuids() ||
+       hotspot_manager_->HasPendingMetadataScans() ||
+       hotspot_manager_->HasPendingPartialMerge());
+  if (!has_work) {
+    return;
+  }
+
+  ++bg_delta_scheduled_;
+  env_->Schedule(&DBImpl::BGWorkDelta, this, Env::Priority::LOW, nullptr);
+}
+
+void DBImpl::BackgroundDeltaWork() {
+  TEST_SYNC_POINT("DBImpl::BackgroundDeltaWork:Start");
+  if (hotspot_manager_ != nullptr) {
+    hotspot_manager_->CompactAndFlushGDCTLogIfNeeded();
+    ProcessPendingHotCuids();
+    ProcessPendingMetadataScans();
+    ProcessPendingPartialMerge();
+  }
+
+  {
+    InstrumentedMutexLock l(&mutex_);
+    --bg_delta_scheduled_;
+    if (bg_delta_scheduled_ == 0) {
+      bg_cv_.SignalAll();
+    }
+    MaybeScheduleDeltaWork();
   }
 }
 

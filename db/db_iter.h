@@ -9,10 +9,15 @@
 
 #pragma once
 #include <cstdint>
+#include <memory>
 #include <string>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 
 #include "db/db_impl/db_impl.h"
 #include "db/range_del_aggregator.h"
+#include "delta/hotspot_manager.h"
 #include "memory/arena.h"
 #include "options/cf_options.h"
 #include "rocksdb/db.h"
@@ -125,16 +130,7 @@ class DBIter final : public Iterator {
   DBIter(const DBIter&) = delete;
   void operator=(const DBIter&) = delete;
 
-  ~DBIter() override {
-    // Release pinned data if any
-    if (pinned_iters_mgr_.PinningEnabled()) {
-      pinned_iters_mgr_.ReleasePinnedData();
-    }
-    RecordTick(statistics_, NO_ITERATOR_DELETED);
-    ResetInternalKeysSkippedCounter();
-    local_stats_.BumpGlobalStatistics(statistics_);
-    iter_.DeleteIter(arena_mode_);
-  }
+  ~DBIter() override;
   void SetIter(InternalIterator* iter) {
     assert(iter_.iter() == nullptr);
     iter_.Set(iter);
@@ -237,6 +233,8 @@ class DBIter final : public Iterator {
   bool FindNextUserEntry(bool skipping_saved_key, const Slice* prefix);
   // Internal implementation of FindNextUserEntry().
   bool FindNextUserEntryInternal(bool skipping_saved_key, const Slice* prefix);
+  bool HandleDeltaVisibleValue();
+  void MaybeFinalizeDeltaScan();
   bool ParseKey(ParsedInternalKey* key);
   bool MergeValuesNewToOld();
 
@@ -384,12 +382,45 @@ class DBIter final : public Iterator {
   bool expose_blob_index_;
   bool is_blob_;
   bool arena_mode_;
+  struct DeltaScanContext {
+    uint64_t last_cuid = 0;
+    std::unordered_set<uint64_t> visited_units_for_cuid;
+    bool is_current_hot = false;
+    bool trigger_scan_as_compaction = false;
+    std::string scan_first_key;
+    std::string scan_last_key;
+    std::string key_encode_buf;
+    std::vector<std::pair<std::string, std::string>> scan_data;
+    bool cached_cuid_is_deleted = false;
+    uint64_t cached_deleted_check_cuid = 0;
+    uint64_t cached_phys_id = 0;
+
+    const std::string& GetScanLastKey() const {
+      return scan_data.empty() ? scan_last_key : scan_data.back().first;
+    }
+
+    void Reset() {
+      last_cuid = 0;
+      visited_units_for_cuid.clear();
+      is_current_hot = false;
+      trigger_scan_as_compaction = false;
+      scan_first_key.clear();
+      scan_last_key.clear();
+      key_encode_buf.clear();
+      scan_data.clear();
+      cached_cuid_is_deleted = false;
+      cached_deleted_check_cuid = 0;
+      cached_phys_id = 0;
+    }
+  } delta_ctx_;
   // List of operands for merge operator.
   MergeContext merge_context_;
   LocalStatistics local_stats_;
   PinnedIteratorsManager pinned_iters_mgr_;
   DBImpl* db_impl_;
   ColumnFamilyData* cfd_;
+  std::shared_ptr<HotspotManager> hotspot_manager_;
+  const ReadOptions read_options_;
   const Slice* const timestamp_ub_;
   const Slice* const timestamp_lb_;
   const size_t timestamp_size_;

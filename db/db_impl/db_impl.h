@@ -75,6 +75,7 @@ class MemTable;
 class PersistentStatsHistoryIterator;
 class TableCache;
 class TaskLimiterToken;
+class HotspotManager;
 class Version;
 class VersionEdit;
 class VersionSet;
@@ -2041,6 +2042,13 @@ class DBImpl : public DB {
   ColumnFamilyData* GetColumnFamilyDataByName(const std::string& cf_name);
 
   void MaybeScheduleFlushOrCompaction();
+  static void BGWorkDelta(void* arg);
+  void BackgroundDeltaWork();
+  void MaybeScheduleDeltaWork();
+  void InitializeHotspotManager(const Options& options);
+  void ProcessPendingHotCuids();
+  void ProcessPendingMetadataScans();
+  void ProcessPendingPartialMerge();
 
   struct FlushRequest {
     FlushReason flush_reason;
@@ -2704,6 +2712,16 @@ class DBImpl : public DB {
   // The number of LockWAL called without matching UnlockWAL call.
   // See also lock_wal_write_token_
   uint32_t lock_wal_count_;
+
+ public:
+  std::shared_ptr<HotspotManager> GetHotspotManager() const {
+    return hotspot_manager_;
+  }
+  void NotifyDeltaBGWork();
+
+ private:
+  std::shared_ptr<HotspotManager> hotspot_manager_;
+  int bg_delta_scheduled_ = 0;
 };
 
 class GetWithTimestampReadCallback : public ReadCallback {

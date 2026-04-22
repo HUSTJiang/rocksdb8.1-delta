@@ -9,6 +9,7 @@
 #include <cinttypes>
 
 #include "db/db_impl/db_impl.h"
+#include "delta/hotspot_manager.h"
 #include "db/error_handler.h"
 #include "db/event_helpers.h"
 #include "logging/logging.h"
@@ -77,6 +78,20 @@ Status DBImpl::Delete(const WriteOptions& write_options,
   if (!s.ok()) {
     return s;
   }
+  if (hotspot_manager_) {
+    uint64_t cuid = hotspot_manager_->ExtractCUID(key);
+    if (cuid != 0 && hotspot_manager_->GetDeleteTable().IsTracked(cuid)) {
+      SequenceNumber seq = versions_->LastSequence();
+      Status ds =
+          hotspot_manager_->InterceptDelete(key, seq, write_options.sync);
+      if (!ds.IsNotSupported()) {
+        if (ds.ok()) {
+          NotifyDeltaBGWork();
+        }
+        return ds;
+      }
+    }
+  }
   return DB::Delete(write_options, column_family, key);
 }
 
@@ -86,6 +101,20 @@ Status DBImpl::Delete(const WriteOptions& write_options,
   const Status s = FailIfTsMismatchCf(column_family, ts, /*ts_for_read=*/false);
   if (!s.ok()) {
     return s;
+  }
+  if (hotspot_manager_) {
+    uint64_t cuid = hotspot_manager_->ExtractCUID(key);
+    if (cuid != 0 && hotspot_manager_->GetDeleteTable().IsTracked(cuid)) {
+      SequenceNumber seq = versions_->LastSequence();
+      Status ds =
+          hotspot_manager_->InterceptDelete(key, seq, write_options.sync);
+      if (!ds.IsNotSupported()) {
+        if (ds.ok()) {
+          NotifyDeltaBGWork();
+        }
+        return ds;
+      }
+    }
   }
   return DB::Delete(write_options, column_family, key, ts);
 }
